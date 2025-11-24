@@ -35,10 +35,18 @@ class TransitionModule(
                 (self._state_dim,),
             )
         )
-        self._matrix = ProbabilityParameter[T, TC](
+        self._matrix1 = ProbabilityParameter[T, TC](
             self._config.matrix.probability_parameter,
             (self._state_dim, self._state_dim),
         )
+        self._matrix2 = ProbabilityParameter[T, TC](
+            self._config.matrix.probability_parameter,
+            (self._state_dim, self._state_dim, self._state_dim),
+        )
+        # self._eps = ProbabilityParameter[T, TC](
+        #     self._config.matrix.probability_parameter,
+        #     (self._state_dim, self._state_dim, 2),
+        # )
 
         self._init_batch_size(batch_size=1)
 
@@ -82,28 +90,73 @@ class TransitionModule(
     def initial_state(self, initial_state: torch.Tensor) -> None:
         self._initial_state.set_value(initial_state)
 
+    # @property
+    # def eps(
+    #     self,
+    # ) -> ProbabilityParameter[T, TC]:
+    #     return self._eps
+
+    # @property
+    # def eps(self) -> torch.Tensor:
+    #     eps: torch.Tensor = self._eps()
+    #     return eps
+
+    # @eps.setter
+    # def eps(self, eps: torch.Tensor) -> None:
+    #     self._eps.set_value(eps)
+
     @property
-    def matrix_parameter(
+    def matrix_parameter1(
         self,
     ) -> ProbabilityParameter[T, TC]:
-        return self._matrix
+        return self._matrix1
 
     @property
-    def matrix(self) -> torch.Tensor:
-        matrix: torch.Tensor = self._matrix()
-        return matrix
+    def matrix1(self) -> torch.Tensor:
+        matrix1: torch.Tensor = self._matrix1()
+        return matrix1
 
-    @matrix.setter
-    def matrix(self, matrix: torch.Tensor) -> None:
-        self._matrix.set_value(matrix)
+    @matrix1.setter
+    def matrix1(self, matrix1: torch.Tensor) -> None:
+        self._matrix1.set_value(matrix1)
+    
+    @property
+    def matrix_parameter2(
+        self,
+    ) -> ProbabilityParameter[T, TC]:
+        return self._matrix2
+
+    @property
+    def matrix2(self) -> torch.Tensor:
+        matrix2: torch.Tensor = self._matrix2()
+        return matrix2
+
+    @matrix2.setter
+    def matrix2(self, matrix2: torch.Tensor) -> None:
+        self._matrix2.set_value(matrix2)
 
     @torch.compile
     def _prediction(
         self,
         estimated_state: torch.Tensor,
-        transition_matrix: torch.Tensor,
+        transition_matrix1: torch.Tensor,
+        transition_matrix2: torch.Tensor,
+        # eps,
+        k,
+        state_dim,
+        batch_size
     ) -> torch.Tensor:
-        predicted_next_state = torch.matmul(estimated_state, transition_matrix)
+        if k == 0:
+            estimated_state = estimated_state.unsqueeze(2).expand(batch_size, state_dim, state_dim)
+            predicted_next_state = estimated_state * transition_matrix1
+        else:
+            # f1 = torch.matmul(eps[:, :, 0], transition_matrix1.transpose(0, 1))
+            # f2 = torch.diag(torch.matmul(eps[:, :, 1], transition_matrix2.transpose(0, 1))).unsqueeze(1).expand(state_dim, state_dim)
+            # f = f1 + f2
+            # estimated_state = estimated_state
+            predicted_next_state = torch.sum(estimated_state.unsqueeze(2).expand(batch_size, state_dim, state_dim, state_dim).transpose(2, 3) * transition_matrix2, dim=1)
+            # predicted_next_state = torch.diagonal(predicted_next_state, dim1=1, dim2=2)
+        # print(torch.sum(predicted_next_state, dim=(1, 2)))
         return predicted_next_state
 
     @torch.compile
@@ -111,34 +164,51 @@ class TransitionModule(
         self,
         prior_state: torch.Tensor,
         likelihood_state: torch.Tensor,
+        k,
+        state_dim,
+        batch_size
     ) -> torch.Tensor:
         # update step based on likelihood_state (conditional probability)
-        posterior_state = nn.functional.normalize(
-            prior_state * likelihood_state,
-            p=1,
-            dim=1,
-        )  # (batch_size, state_dim)
+        if k == 0:
+            posterior_state = nn.functional.normalize(
+                prior_state * likelihood_state,
+                p=1,
+                dim=1,
+            )  # (batch_size, state_dim)
+        else:
+            likelihood_state_expanded = likelihood_state.unsqueeze(2).expand(batch_size, state_dim, state_dim).transpose(1, 2)
+            posterior_state = nn.functional.normalize(
+                prior_state * likelihood_state_expanded,
+                p=1,
+                dim=(1, 2),
+            )  # (batch_size, state_dim, state_dim)
         return posterior_state
 
     def _process(
         self,
         estimated_state: torch.Tensor,
         likelihood_state: torch.Tensor,
+        # eps,
+        k,
+        state_dim,
+        batch_size
     ) -> torch.Tensor:
+
         # update step based on input_state (conditional probability)
         estimated_state = self._update(
-            estimated_state, likelihood_state
-        )  # (batch_size, state_dim)
+            estimated_state, likelihood_state, k, state_dim, batch_size
+        )  # (batch_size, state_dim, state_dim)
 
         # prediction step based on model process (predicted probability)
         estimated_state = self._prediction(
-            estimated_state, self.matrix
-        )  # (batch_size, state_dim)
+            estimated_state, self.matrix1, self.matrix2, k, state_dim, batch_size
+        )  # (batch_size, state_dim, state_dim)
 
         return estimated_state
 
     def forward(self, emission_trajectory: torch.Tensor) -> torch.Tensor:
-        batch_size, _, horizon = emission_trajectory.shape
+
+        batch_size, state_dim, horizon = emission_trajectory.shape
         # (batch_size, state_dim, horizon)
 
         estimated_state_trajectory = torch.empty(
@@ -149,27 +219,41 @@ class TransitionModule(
         estimated_state = self.initial_state.repeat(batch_size, 1)
         # (batch_size, state_dim)
 
+        # eps = self.eps
+
         for k in range(horizon):
+
             estimated_state = self._process(
                 estimated_state,
                 emission_trajectory[:, :, k],
+                # eps,
+                k,
+                state_dim,
+                batch_size
             )
 
-            estimated_state_trajectory[:, :, k] = estimated_state
+            estimated_state_trajectory[:, :, k] = torch.sum(estimated_state, dim=1)
 
         return estimated_state_trajectory
 
     @torch.inference_mode()
     def at_inference(self, emission_trajectory: torch.Tensor) -> torch.Tensor:
-        batch_size, _, horizon = emission_trajectory.shape
+        batch_size, state_dim, horizon = emission_trajectory.shape
+
+        # eps = self.eps
 
         self._check_batch_size(batch_size)
 
         for k in range(horizon):
-            self._estimated_state = self._process(
+
+            self._estimated_state = torch.sum(self._process(
                 self._estimated_state,
                 emission_trajectory[:, :, k],
-            )
+                # eps,
+                k,
+                state_dim,
+                batch_size
+            ), dim=1)
 
         return self.estimated_state
 
